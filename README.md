@@ -99,3 +99,7 @@ The suite runs `cx` against stub `codex`, `ccswap` and `pgrep` binaries in a tem
 ## Credits
 
 Account storage, usage tracking and switching are provided by [ccswap](https://github.com/errhythm/ccswap).
+
+## License
+
+[MIT](LICENSE)
