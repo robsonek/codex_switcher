@@ -1,0 +1,423 @@
+#!/bin/bash
+# cx — runs the Codex CLI and, when the account's usage limit runs out, switches
+#      to another ChatGPT account (via ccswap) and keeps working on the new one.
+#
+# Usage:
+#   cx [codex arguments]    interactive codex; on exit checks the limit and switches if needed
+#   cx exec …               like `codex exec …`; when a usage limit interrupts the task, switches
+#                           accounts and resumes the session automatically (review is rerun)
+#   cx add [--device-auth]  add another account (browser login)
+#   cx list                 usage limits of all accounts
+#   cx switch [N|email]     manual switch (no argument: account with the most headroom)
+#   cx check                check the limit now and switch if needed
+#   cx help                 this help
+#
+# Environment:
+#   CX_THRESHOLD  usage % at which the account is switched (default 90)
+
+set -u
+
+THRESHOLD="${CX_THRESHOLD:-90}"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+AUTH="$CODEX_DIR/auth.json"
+
+say()  { printf '\033[36m[cx]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[33m[cx]\033[0m %s\n' "$*" >&2; }
+
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+
+for bin in codex ccswap; do
+  command -v "$bin" >/dev/null 2>&1 || { warn "Command not found: $bin"; exit 1; }
+done
+
+daemon_running() { codex app-server daemon version >/dev/null 2>&1; }
+
+# The shared Codex daemon keeps the login in memory.
+stop_daemon() {
+  if daemon_running; then
+    say "Stopping the Codex daemon so it picks up the new account (other open codex sessions will need to be resumed)."
+    codex app-server daemon stop >/dev/null 2>&1 \
+      || warn "Could not stop the daemon — run manually: codex app-server daemon stop"
+  fi
+}
+
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+
+# The daemon started before the last change of auth.json → it may still run on the previous account.
+# (A false alarm after a regular token refresh is harmless: the session just starts without the daemon.)
+daemon_stale() {
+  local start mt
+  daemon_running || return 1
+  start=$(grep -o '"startSeconds":[0-9]*' "$CODEX_DIR/app-server-daemon/daemon.pid" 2>/dev/null | cut -d: -f2)
+  mt=$(file_mtime "$AUTH")
+  [ -n "$start" ] && [ -n "$mt" ] && [ "$mt" -ge "$start" ]   # the same second counts as stale too
+}
+
+has_arg() { local x n=$1; shift; for x in "$@"; do [ "$x" = "$n" ] && return 0; done; return 1; }
+
+active_account() {
+  ccswap codex status --json 2>/dev/null \
+    | sed -n 's/.*"activeAccountNumber": *\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+# Switches the account if the active one crossed the threshold.
+# Exit codes: 0 = switched, 2 = nothing to do, 3 = no account with headroom, other = error.
+check_and_switch() {
+  local out rc
+  out=$(ccswap codex auto --once --threshold "$THRESHOLD" 2>&1)
+  rc=$?
+  case $rc in
+    0) say "Active account is close to its limit — switched to account #$(active_account)." ;;
+    2) : ;;
+    3) if printf '%s' "$out" | grep -qi "exhausted"; then
+         report_all_exhausted
+       else
+         warn "The other accounts are close to their limits too — staying on account #$(active_account) until it is exhausted, then switching to the account with the most left."
+       fi ;;
+    *) warn "ccswap reported an error (code $rc):"
+       printf '%s\n' "$out" >&2 ;;
+  esac
+  return $rc
+}
+
+report_all_exhausted() {
+  warn "All accounts have hit their limits — work will stop until the next reset:"
+  ccswap codex usage >&2
+  warn "An account with \"Resets: N banked\" can be unlocked manually: ccswap codex redeem-reset <number>"
+}
+
+# ---------------------------------------------------------------------------
+# cx add
+# ---------------------------------------------------------------------------
+
+ADD_BAK=""
+# Restores the set-aside auth.json if the login did not produce a new one (also after Ctrl-C).
+restore_add_backup() {
+  if [ -n "$ADD_BAK" ] && [ -f "$ADD_BAK" ] && [ ! -f "$AUTH" ]; then
+    mv "$ADD_BAK" "$AUTH" && warn "Previous login restored."
+  fi
+}
+
+# Adds another account. The current auth.json is moved aside during the login,
+# so `codex login` cannot touch the previous account's tokens in any way.
+add_account() {
+  local prev="" busy
+  stop_daemon
+  busy=$(pgrep -x codex | tr '\n' ',' | sed 's/,$//')
+  if [ -n "$busy" ]; then
+    warn "Another codex process is running — wait for it to finish (or close it) and try again"
+    warn "(it could overwrite auth.json with the previous account's tokens):"
+    ps -o pid=,lstart=,command= -p "$busy" | cut -c1-150 >&2
+    return 1
+  fi
+  if [ -f "$AUTH" ]; then
+    say "Saving the current account in ccswap…"
+    ccswap codex add >/dev/null || { warn "Could not save the current account — aborting."; return 1; }
+    prev=$(active_account)
+    ADD_BAK="$AUTH.cx-backup"
+    trap 'restore_add_backup' EXIT
+    trap 'restore_add_backup; exit 130' INT
+    trap 'restore_add_backup; exit 143' TERM
+    trap 'restore_add_backup; exit 129' HUP
+    mv "$AUTH" "$ADD_BAK" || return 1
+  fi
+  say "Log in in the browser with ANOTHER account (different from the ones already added)."
+  if ! codex login "$@" || [ ! -f "$AUTH" ]; then
+    if [ -f "$AUTH" ]; then
+      warn "Login failed. Backup of the previous login: $ADD_BAK"
+    else
+      warn "Login failed."
+      restore_add_backup
+    fi
+    return 1
+  fi
+  if ! ccswap codex add; then
+    warn "Logged in, but ccswap did not save the new account — it only exists in auth.json."
+    [ -n "$ADD_BAK" ] && warn "The previous login is kept in the backup: $ADD_BAK"
+    return 1
+  fi
+  [ -n "$ADD_BAK" ] && rm -f "$ADD_BAK"
+  if [ -n "$prev" ]; then
+    if ccswap codex switch "$prev" >/dev/null 2>&1; then
+      say "Switched back to the previously active account #$prev."
+    else
+      warn "Could not switch back to account #$prev — the new account is active."
+    fi
+  fi
+  ccswap codex list
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# cx exec: when a usage limit interrupts the task — switch accounts and finish it
+# ---------------------------------------------------------------------------
+
+CONTINUE_PROMPT="Continue the task exactly where it was interrupted — the interruption was caused by the account's usage limit, not by a problem with the task. Finish it and give the final result in the form the original instructions asked for."
+# Usage-limit error: text mode ("ERROR: You've hit your usage limit…") and --json (turn.failed / error).
+LIMIT_RE='^ERROR: .*([Uu]sage limit|credits|quota)|"type":"(turn\.failed|error)".*([Uu]sage limit|usage_limit|credits|quota)'
+
+# Parses `codex exec` arguments and prepares options for `codex exec resume`.
+# Sets: MODE (exec|resume|review), KEEP (options for resume), CD_DIR, ORIG_SID,
+#       CAN_RESUME (1 = we know how to resume safely), USES_STDIN_PROMPT.
+parse_exec_args() {
+  MODE=exec; KEEP=(); CD_DIR=""; ORIG_SID=""; CAN_RESUME=1; USES_STDIN_PROMPT=0
+  local a pos=0 last=0 opts=1
+  while [ $# -gt 0 ]; do
+    a=$1; shift
+    if [ $opts -eq 1 ]; then
+      case "$a" in
+        --) opts=0; continue ;;   # only positional arguments from here on (no subcommands)
+        # options with a value that resume accepts unchanged
+        -c|--config|--enable|--disable|-m|--model|--thread-source|--cyber-access-program|--output-schema|-o|--output-last-message)
+          [ $# -gt 0 ] || { CAN_RESUME=0; break; }
+          KEEP+=("$a" "$1"); shift; continue ;;
+        --config=*|--enable=*|--disable=*|--model=*|--thread-source=*|--cyber-access-program=*|--output-schema=*|--output-last-message=*)
+          KEEP+=("$a"); continue ;;
+        # flags that resume accepts unchanged
+        --strict-config|--dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust|--skip-git-repo-check|--ignore-user-config|--ignore-rules|--json|--worktree)
+          KEEP+=("$a"); continue ;;
+        # resume has no -s: carried over as -c sandbox_mode=…
+        -s|--sandbox) [ $# -gt 0 ] || { CAN_RESUME=0; break; }
+          KEEP+=(-c "sandbox_mode=\"$1\""); shift; continue ;;
+        --sandbox=*) KEEP+=(-c "sandbox_mode=\"${a#*=}\""); continue ;;
+        # resume has no -C: we resume inside that directory
+        -C|--cd) [ $# -gt 0 ] || { CAN_RESUME=0; break; }
+          CD_DIR=$1; shift; continue ;;
+        --cd=*) CD_DIR=${a#*=}; continue ;;
+        # images are already in the session history, color does not matter
+        -i|--image|--color) [ $# -gt 0 ] && shift; continue ;;
+        --image=*|--color=*) continue ;;
+        # session is not persisted, or the option changes behavior in a way resume cannot reproduce
+        --ephemeral|--oss|--approve-for-me) CAN_RESUME=0; continue ;;
+        -p|--profile|--local-provider|--add-dir) CAN_RESUME=0; [ $# -gt 0 ] && shift; continue ;;
+        --profile=*|--local-provider=*|--add-dir=*) CAN_RESUME=0; continue ;;
+        --last) last=1; continue ;;
+        --all) continue ;;
+        -?*) [ "$MODE" = review ] || CAN_RESUME=0; continue ;;   # unknown option — do not guess
+      esac
+    fi
+    # positional argument ("-" = prompt from stdin)
+    pos=$((pos+1))
+    [ "$a" = - ] && USES_STDIN_PROMPT=1
+    if [ $opts -eq 1 ] && [ $pos -eq 1 ] && { [ "$a" = resume ] || [ "$a" = review ]; }; then
+      MODE=$a
+    elif [ "$MODE" = resume ] && [ $pos -eq 2 ]; then
+      ORIG_SID=$a
+    fi
+  done
+  [ $last -eq 1 ] && ORIG_SID=""   # with --last the first argument is the prompt, not an id
+  return 0
+}
+
+CHILD_PIDS=""
+kill_children() {
+  [ -n "$CHILD_PIDS" ] || return 0
+  kill -TERM $CHILD_PIDS 2>/dev/null
+  wait $CHILD_PIDS 2>/dev/null   # only our own processes — never a bare `wait`
+  CHILD_PIDS=""
+}
+
+set_exec_traps() {
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+}
+
+# Runs codex, streaming stdout/stderr live while saving copies of both.
+# Codex runs in the background + `wait`, so that a signal to cx (TERM/INT/HUP)
+# immediately stops codex and both `tee`s as well. Codex reads stdin from fd 3. Sets RUN_RC.
+run_captured() {
+  local fo="$TMPD/out.fifo" fe="$TMPD/err.fifo" cpid
+  rm -f "$fo" "$fe"
+  if ! mkfifo "$fo" "$fe"; then codex "$@" <&3; RUN_RC=$?; return; fi
+  # A signal arriving during startup is handled only after all PIDs are registered
+  # (otherwise a `tee` could stay blocked on a FIFO that never gets a writer).
+  PENDING_SIG=""
+  trap 'PENDING_SIG=143' TERM
+  trap 'PENDING_SIG=130' INT
+  trap 'PENDING_SIG=129' HUP
+  tee "$TMPD/out" <"$fo" &
+  CHILD_PIDS="$!"
+  tee "$TMPD/err" <"$fe" >&2 &
+  CHILD_PIDS="$CHILD_PIDS $!"
+  codex "$@" <&3 >"$fo" 2>"$fe" &
+  cpid=$!
+  CHILD_PIDS="$CHILD_PIDS $cpid"
+  set_exec_traps
+  [ -n "$PENDING_SIG" ] && exit "$PENDING_SIG"
+  wait "$cpid"
+  RUN_RC=$?
+  wait $CHILD_PIDS 2>/dev/null
+  CHILD_PIDS=""
+}
+
+limit_hit() {
+  [ "$RUN_RC" -ne 0 ] && grep -qE "$LIMIT_RE" "$TMPD/err" "$TMPD/out" 2>/dev/null
+}
+
+last_session_id() {
+  local s
+  s=$(grep -m1 -oE 'session id: [0-9a-fA-F-]{36}' "$TMPD/err" 2>/dev/null | awk '{print $3}')
+  [ -n "$s" ] || s=$(grep -m1 -oE '"thread_id":"[0-9a-fA-F-]{36}"' "$TMPD/out" 2>/dev/null | cut -d'"' -f4)
+  [ -n "$s" ] || s=$ORIG_SID
+  printf '%s' "$s"
+}
+
+# After a confirmed usage-limit error, move to any account with headroom — also when
+# ccswap's reading does not show it yet (code 2) or the hysteresis margin blocks a regular
+# switch (code 3 without "exhausted"). Returns 0 only if the account actually changed.
+switch_after_limit() {
+  local out rc
+  out=$(ccswap codex auto --once --threshold "$THRESHOLD" 2>&1)
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    say "Switched to account #$(active_account)."
+    return 0
+  fi
+  if [ $rc -eq 3 ] && printf '%s' "$out" | grep -qi "exhausted"; then
+    report_all_exhausted
+    return 1
+  fi
+  if [ $rc -ne 2 ] && [ $rc -ne 3 ]; then
+    warn "ccswap reported an error (code $rc):"; printf '%s\n' "$out" >&2
+    return 1
+  fi
+  out=$(ccswap codex switch --strategy next-available --json 2>&1)
+  if printf '%s' "$out" | grep -qE '"switched": *true'; then
+    say "Codex reported a usage limit — switched to account #$(active_account)."
+    return 0
+  fi
+  warn "No other account has any limit left."
+  return 1
+}
+
+run_exec() {
+  local attempt=0 max sid
+  # Traps first, then the directory: a signal during mktemp is handled only after
+  # TMPD is assigned, so the directory is always cleaned up.
+  TMPD=""
+  trap 'kill_children; [ -n "$TMPD" ] && rm -rf "$TMPD"' EXIT
+  set_exec_traps
+  TMPD=$(mktemp -d "${TMPDIR:-/tmp}/cx.XXXXXX") || exit 1
+  if ! { exec 3<&0; } 2>/dev/null; then exec 3</dev/null; fi   # closed stdin → /dev/null
+  parse_exec_args "${@:2}"
+
+  check_and_switch
+  run_captured "$@"
+  exec 3</dev/null   # resumed runs no longer read the original stdin
+
+  max=$(ccswap codex list 2>/dev/null | grep -cE '^ *[0-9]+ ')
+  [ "${max:-0}" -gt 0 ] 2>/dev/null || max=5
+  while limit_hit && [ $attempt -lt "$max" ]; do
+    attempt=$((attempt+1))
+    sid=$(last_session_id)
+    if ! switch_after_limit; then
+      warn "Task interrupted by the usage limit."
+      break
+    fi
+    if [ "$MODE" = review ] && [ $USES_STDIN_PROMPT -eq 0 ]; then
+      say "The usage limit interrupted the review — rerunning it from the start on account #$(active_account)…"
+      run_captured "$@"
+    elif [ $CAN_RESUME -eq 1 ] && [ "$MODE" != review ] && [ -n "$sid" ]; then
+      say "The usage limit interrupted the task — resuming session $sid on account #$(active_account)…"
+      if [ -n "$CD_DIR" ]; then cd "$CD_DIR" || break; CD_DIR=""; fi
+      run_captured exec resume ${KEEP[@]+"${KEEP[@]}"} "$sid" "$CONTINUE_PROMPT"
+    else
+      warn "Account switched, but this invocation cannot be resumed safely — run it again${sid:+ (session: $sid)}."
+      break
+    fi
+  done
+
+  # After finishing: if the account is close to its limit, prepare a better one for the next calls.
+  limit_hit || check_and_switch >/dev/null 2>&1
+  exit "$RUN_RC"
+}
+
+# ---------------------------------------------------------------------------
+# Interactive mode
+# ---------------------------------------------------------------------------
+
+# Builds resume arguments from the original invocation: the same options (e.g. -C, -m, -c),
+# without the prompt and images; the specific session id if one was given, otherwise --last.
+build_interactive_resume() {
+  RESUME_ARGS=(resume)
+  local a pos=0 sub="" sid="" last=0 opts=1
+  while [ $# -gt 0 ]; do
+    a=$1; shift
+    if [ $opts -eq 1 ]; then
+      case "$a" in
+        --) opts=0; continue ;;
+        -c|--config|--enable|--disable|--remote|--remote-auth-token-env|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-C|--cd|--add-dir|-a|--ask-for-approval)
+          [ $# -gt 0 ] && { RESUME_ARGS+=("$a" "$1"); shift; }; continue ;;
+        -i|--image) [ $# -gt 0 ] && shift; continue ;;
+        --image=*) continue ;;
+        --last) last=1; continue ;;
+        -?*) RESUME_ARGS+=("$a"); continue ;;   # e.g. --all, --include-non-interactive, --no-daemon
+      esac
+    fi
+    pos=$((pos+1))
+    if [ $opts -eq 1 ] && [ $pos -eq 1 ] && { [ "$a" = resume ] || [ "$a" = fork ]; }; then sub=$a
+    elif [ "$sub" = resume ] && [ $pos -eq 2 ]; then sid=$a
+    fi
+  done
+  if [ -n "$sid" ] && [ $last -eq 0 ]; then RESUME_ARGS+=("$sid"); else RESUME_ARGS+=(--last); fi
+}
+
+# Launches interactive codex; if the daemon may still run on the previous account,
+# this session starts without it (other open sessions are not interrupted).
+launch_interactive() {
+  if ! has_arg --no-daemon "$@" && daemon_stale; then
+    say "The Codex daemon still runs on the previous account — starting this session without it (--no-daemon)."
+    case "${1:-}" in
+      resume|fork) codex "$1" --no-daemon "${@:2}" ;;
+      *)           codex --no-daemon "$@" ;;
+    esac
+  else
+    codex "$@"
+  fi
+}
+
+case "${1:-}" in
+  add)       shift; add_account "$@"; exit $? ;;
+  list|ls)   ccswap codex usage; exit $? ;;
+  check)     check_and_switch; exit $? ;;
+  help)      usage; exit 0 ;;
+  switch|sw) shift
+             if [ $# -eq 0 ]; then out=$(ccswap codex switch --strategy best --json 2>&1)
+             else out=$(ccswap codex switch "$@" --json 2>&1); fi
+             rc=$?
+             if printf '%s' "$out" | grep -qE '"switched": *true'; then
+               say "Switched to account #$(active_account)."; stop_daemon
+             elif [ $rc -eq 0 ]; then
+               say "No change — account #$(active_account) stays active."
+             else
+               printf '%s\n' "$out" >&2
+             fi
+             exit $rc ;;
+  exec|e)    run_exec "$@" ;;
+  # `codex review` (not exec): check the limit before and after, no automatic resume.
+  review)    check_and_switch; codex "$@"; rc=$?; check_and_switch; exit $rc ;;
+  # All other codex subcommands are passed through unchanged.
+  login|logout|mcp|plugin|app-server|remote-control|app|completion|update|doctor|sandbox|debug|apply|a|queue|archive|delete|unarchive|migrate-*|cloud|exec-server|features|agents|-h|--help|-V|--version)
+             exec codex "$@" ;;
+esac
+
+trap ':' INT   # Ctrl-C belongs to codex, it must not close the wrapper
+build_interactive_resume "$@"
+check_and_switch
+args=("$@")
+while :; do
+  before=$(active_account)
+  launch_interactive ${args[@]+"${args[@]}"}
+  rc=$?
+  if ! check_and_switch; then
+    # The account may have been switched during the session by an agent's `cx exec`.
+    after=$(active_account)
+    if [ -z "$before" ] || [ -z "$after" ] || [ "$before" = "$after" ]; then exit $rc; fi
+    say "The account was switched during the session (#$before → #$after)."
+  fi
+  printf '\033[36m[cx]\033[0m Resume the session on the new account? [Y/n] ' >&2
+  read -r ans || exit $rc
+  case "$ans" in [nN]*) exit $rc ;; esac
+  args=(${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"})
+done
